@@ -1,0 +1,12 @@
+# 运行时产物（不提交）
+__pycache__/
+*.pyc
+*.pyo
+
+# 数据（L2 原始数据在 43 服务器，勿入库）
+l2_data/
+archive_*/
+
+# 运行日志
+watchdog.log
+watchdog_cron.log
