@@ -12,6 +12,9 @@
   · conn_loop x2   : 各持一条 WS, 收帧→去重→入队; 独立指数退避重连 (3s→60s)
   · writer_loop    : 消费队列写 gzip; 单文件模型(同线只开当前 slug 一个句柄, bar 切换
                      同步关旧开新, 丢弃切 bar 竞态旧 slug 尾消息 → 防 reopen/truncate 损坏; 管 gap 状态机
+  · 切 bar 重建订阅 : 换市场时拉高订阅代 → 两条连接各自换**新连接**重建订阅
+                     ← 实测在旧连接上追加订阅帧不生效(连接仍活但新市场零消息),
+                       不重建则每 bar 前 ~120s 数据永久缺失
   · ticker_loop    : 每 5s 算 bar→取新市场 token (gamma, to_thread) → sub_ver++ 通知重订阅
   单条 WS 连接订阅的仍是当前 slug 的 up/down 两 token (实测 1 连接多 token 会被踢).
 
@@ -56,6 +59,17 @@ DOWN_AFTER = 60.0  # 该时长无任何帧 → 视为该连接已 down
 CLOSE_DELAY = 30.0  # bar 切换后旧文件延迟关闭窗口 (吸收残留尾消息)
 DEDUP_WIN = 60.0  # 跨连接去重窗口秒
 DEDUP_MAX = 40000  # 去重窗口最大 key 数
+SILENT_ROTATE_AFTER = 45.0  # 市场活跃但该时长无写盘 → 判订阅失效, 强制重建
+TICK_POLL_S = 1.0  # bar 切换检测间隔(原 5s -> 新 bar 头 3~11s 无数据)
+ROTATE_WAIT_S = 1.0  # 重建订阅的重连等待(原 2s)
+FLUSH_EVERY_S = 2.0  # 磁盘可见性: 每 2s flush 一次
+#   ⚠ 原来只每 1000 行 flush → 磁盘上可见数据可能落后 ~60s
+#   → 任何“实时对比 L2”的测量(如 hub vs L2 报价滞后)都会失准
+
+# ⚠ 为什么换市场必须换新连接(2026-09-10 查到)
+#   recorder 切 bar 后仍在旧连接上发 {"assets_ids": 新 token} 订阅帧, 实测 **不生效**:
+#   连接继续收 PONG(活)但新市场零消息 → 只能等服务器 ~2-4min 一次的例行断连重连才恢复。
+#   后果: 2026-09-07/08/09 全部 5m/15m 文件, 每个 bar 只有后 ~180s 有数据。
 
 
 def now_utc():
@@ -122,6 +136,16 @@ class LineDualRecorder:
         self.active_f = None  # 当前活跃 gzip 句柄
         self.active_slug = None  # active_f 对应的 slug
         self.seen: dict = {}  # 去重 key -> ts
+        # ⚠ bar 切换必须在**新连接**上重建订阅: 实测在旧连接上追加订阅帧不生效
+        #   (连接仍活着收 PONG, 但新市场零消息) → 要等服务器 ~2-4min 例行断开才恢复
+        #   → 实测后果: 每个 bar 前 ~120s 数据永久缺失(2026-09-08/09 全量文件均如此)
+        #   实现: 订阅代 sub_gen —— 换市场/静默重建时 +1; 连接侧 my_gen 落后即断连重连
+        #   (用代而非计时器: 旧连接若在 0.5s 内醒来会发无效订阅帧并清掉计时器 → 竞态漏修)
+        self.sub_gen = 0
+        self.n_rotate = [0, 0]
+        self.last_write_ts = 0.0  # 最近成功写盘时刻(静默看门狗)
+        self.n_since_flush = 0  # 自上次 flush 的写入条数
+        self.last_flush_ts = 0.0  # 最近 flush 时刻(时间驱动刷盘)
 
     # ---------- 文件 ----------
     def _path(self, slug):
@@ -149,11 +173,27 @@ class LineDualRecorder:
             self.active_f = None
 
     def _write(self, m) -> bool:
-        """写一条消息到当前活跃文件; 文件未就绪返回 False."""
+        """写一条消息到当前活跃文件; 文件未就绪返回 False.
+
+        磁盘可见性: 每 1000 行 或 每 FLUSH_EVERY_S 秒 flush 一次。
+        只按行数 flush 时, 磁盘上可见数据可能落后 ~60s → 实时对比会失准(2026-09-10 实测)。
+        """
         f = self._open_active()
         if f is None:
             return False
         f.write(json.dumps(m, ensure_ascii=False) + "\n")
+        self.last_write_ts = time.time()
+        self.n_since_flush += 1
+        if (
+            self.n_since_flush >= 1000
+            or self.last_write_ts - self.last_flush_ts >= FLUSH_EVERY_S
+        ):
+            try:
+                f.flush()
+            except Exception:
+                pass
+            self.n_since_flush = 0
+            self.last_flush_ts = self.last_write_ts
         return True
 
     def _write_mark(self, row):
@@ -179,8 +219,12 @@ class LineDualRecorder:
                     self.alive[idx] = time.time()  # 连接建立即算活
                     my_ver = -1
                     my_slug = None
+                    my_gen = self.sub_gen  # 本连接对应的订阅代(换市场/静默重建会 +1)
                     last_any = time.time()
                     while True:
+                        # 换市场 或 静默看门狗 → 必须换新连接重建订阅(旧连接追加订阅帧不生效)
+                        if my_gen < self.sub_gen:
+                            raise ConnectionError("bar_rotate")
                         # 订阅/重订阅: state 换市场后 sub_ver++ → 重发
                         if self.up and self.dn and my_ver != self.sub_ver:
                             sub = {"assets_ids": [self.up, self.dn], "type": "market"}
@@ -251,14 +295,23 @@ class LineDualRecorder:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                self.disc[idx] += 1
-                attempt += 1
-                wait = min(3 * attempt, 60)
-                print(
-                    f"  [{self.coin}-{self.label}][c{idx}] WS 断开({type(e).__name__}) "
-                    f"第{self.disc[idx]}次, {wait}s 后重连",
-                    flush=True,
-                )
+                if "bar_rotate" in str(e):
+                    self.n_rotate[idx] += 1
+                    print(
+                        f"  [{self.coin}-{self.label}][c{idx}] 重建订阅(换新连接), "
+                        f"{ROTATE_WAIT_S:.0f}s 后重连",
+                        flush=True,
+                    )
+                    wait = ROTATE_WAIT_S
+                else:
+                    self.disc[idx] += 1
+                    attempt += 1
+                    wait = min(3 * attempt, 60)
+                    print(
+                        f"  [{self.coin}-{self.label}][c{idx}] WS 断开({type(e).__name__}) "
+                        f"第{self.disc[idx]}次, {wait}s 后重连",
+                        flush=True,
+                    )
                 try:
                     await asyncio.sleep(wait)
                 except asyncio.CancelledError:
@@ -283,6 +336,7 @@ class LineDualRecorder:
                     if tok:
                         self.up, self.dn = tok
                         self.sub_ver += 1  # 通知两连接重订阅
+                        self.sub_gen += 1  # 换市场 → 必须换新连接重建订阅
                         print(
                             f"  [{self.coin}-{self.label}] 新市场 {slug} token 就绪",
                             flush=True,
@@ -300,7 +354,7 @@ class LineDualRecorder:
                     f"  [{self.coin}-{self.label}] ticker err {type(e).__name__}",
                     flush=True,
                 )
-            await asyncio.sleep(5)
+            await asyncio.sleep(TICK_POLL_S)
 
     # ---------- 写盘 + gap (单 task) ----------
     async def writer_loop(self):
@@ -388,6 +442,19 @@ class LineDualRecorder:
                 self.gap_slug = self.slug
         elif self.gap_from is not None and ok:
             self._close_gap(now, resolved=True)
+        # 静默看门狗: 市场订阅中却长时间无写盘 → 订阅失效, 强制换新连接(兜底)
+        if (
+            in_market
+            and self.last_write_ts
+            and now - self.last_write_ts > SILENT_ROTATE_AFTER
+        ):
+            self.last_write_ts = now  # 防每 5s 重复触发
+            self.sub_gen += 1
+            print(
+                f"  [{self.coin}-{self.label}] ⚠ 静默 {SILENT_ROTATE_AFTER:.0f}s 无数据 "
+                f"→ 强制重建订阅",
+                flush=True,
+            )
 
 
 async def main():
@@ -417,7 +484,8 @@ async def main():
                     gap_s = f"(gap挂{time.time() - r.gap_from:.0f}s)"
                 parts.append(
                     f"{r.coin}-{r.label}:{sum(r.msg)}条"
-                    f"丢{sum(r.dup)}断{r.disc}活{sum(1 for a in r.alive if time.time() - a < 60)}/2"
+                    f"丢{sum(r.dup)}断{r.disc}重建{sum(r.n_rotate)}"
+                    f"活{sum(1 for a in r.alive if time.time() - a < 60)}/2"
                     f"gap{r.n_gap}{gap_s}"
                 )
             print(f"  [hb {time.time() - t0:.0f}s] " + " | ".join(parts), flush=True)
