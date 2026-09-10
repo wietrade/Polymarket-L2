@@ -96,6 +96,20 @@ def singleton_acquire():
     print(f"🔒 L2 recorder v3 单例锁取得 ({GUARD_PORT})", flush=True)
 
 
+def ts() -> str:
+    """日志时间戳（**UTC**，HH:MM:SS.mmm）—— 换市场时序定位全靠它。
+
+    为什么必须加（2026-09-11）：原日志没有任何时间戳，导致查「某些 bar 首帧
+    拖到 bar+12.8s」时无法区分两种情况：
+      (a) 我们订阅发晚了      (b) 订阅按时发了、但服务端到那时才回第一帧
+    还新增两条关键打点：`已发订阅` 与 `首帧(发订阅后 Xms)` —— 两者之差就是
+    服务端的响应延迟，与我们的重建耗时彻底分开。
+    输出用 UTC（本地为 UTC+8），便于直接与 bar 起点 epoch 对齐。
+    """
+    t = time.time()
+    return time.strftime("%H:%M:%S", time.gmtime(t)) + f".{int((t % 1) * 1000):03d}"
+
+
 def gamma_tokens(slug):
     """slug -> (up_token, down_token); 异常则 None. (阻塞, 调用方放线程)"""
     try:
@@ -132,6 +146,9 @@ class LineDualRecorder:
         self.disc = [0, 0]
         self.msg = [0, 0]
         self.dup = [0, 0]
+        # 订阅时序打点（每连接）: 发出订阅帧的时刻 / 该订阅后的首帧时刻
+        self.ts_sub = [None, None]
+        self.ts_first = [None, None]
         self.q = asyncio.Queue(maxsize=50000)
         # 统计 / gap
         self.n_gap = 0
@@ -238,6 +255,12 @@ class LineDualRecorder:
                             my_ver = self.sub_ver
                             my_slug = self.slug
                             self.alive[idx] = time.time()
+                            self.ts_sub[idx] = time.time()
+                            self.ts_first[idx] = None
+                            print(
+                                f"  [{self.coin}-{self.label}][c{idx}] {ts()} 已发订阅 {my_slug}",
+                                flush=True,
+                            )
                         try:
                             raw = await asyncio.wait_for(
                                 ws.recv(), timeout=RECV_TIMEOUT
@@ -266,6 +289,19 @@ class LineDualRecorder:
                                 continue
                             if my_slug is None:
                                 continue
+                            # 打点: 每次订阅后的**首帧**（放在去重之前 —— 我们要的是
+                            # 「帧抵达」本身，即使它是重复帧也说明链路已经通了）
+                            if self.ts_first[idx] is None:
+                                self.ts_first[idx] = time.time()
+                                d_ms = (
+                                    self.ts_first[idx]
+                                    - (self.ts_sub[idx] or self.ts_first[idx])
+                                ) * 1000
+                                print(
+                                    f"  [{self.coin}-{self.label}][c{idx}] {ts()} 首帧 "
+                                    f"{my_slug} (发订阅后 {d_ms:.0f}ms)",
+                                    flush=True,
+                                )
                             self.msg[idx] += 1
                             # 连接侧去重窗口 (滤同源重复, 减队列压力)
                             # 唯一键: book→hash(盘口快照哈希), last_trade→transaction_hash(链上tx)
@@ -335,7 +371,7 @@ class LineDualRecorder:
                     self.slug = slug
                     self.up = self.dn = None  # 停旧订阅, 等新 token
                     print(
-                        f"  [{self.coin}-{self.label}] bar→ {slug} (旧 {old})",
+                        f"  [{self.coin}-{self.label}] {ts()} bar→ {slug} (旧 {old})",
                         flush=True,
                     )
                     tok = await asyncio.to_thread(gamma_tokens, slug)
@@ -344,13 +380,13 @@ class LineDualRecorder:
                         self.sub_ver += 1  # 通知两连接重订阅
                         self.sub_gen += 1  # 换市场 → 必须换新连接重建订阅
                         print(
-                            f"  [{self.coin}-{self.label}] 新市场 {slug} token 就绪",
+                            f"  [{self.coin}-{self.label}] {ts()} 新市场 {slug} token 就绪",
                             flush=True,
                         )
                     else:
                         self.slug = None  # 下轮(5s)重试
                         print(
-                            f"  [{self.coin}-{self.label}] {slug} 取 token 失败, 稍后重试",
+                            f"  [{self.coin}-{self.label}] {ts()} {slug} 取 token 失败, 稍后重试",
                             flush=True,
                         )
             except asyncio.CancelledError:
@@ -457,7 +493,7 @@ class LineDualRecorder:
             self.last_write_ts = now  # 防每 5s 重复触发
             self.sub_gen += 1
             print(
-                f"  [{self.coin}-{self.label}] ⚠ 静默 {SILENT_ROTATE_AFTER:.0f}s 无数据 "
+                f"  [{self.coin}-{self.label}] {ts()} ⚠ 静默 {SILENT_ROTATE_AFTER:.0f}s 无数据 "
                 f"→ 强制重建订阅",
                 flush=True,
             )
