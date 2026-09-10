@@ -73,7 +73,7 @@ Polymarket `wss://ws-subscriptions-clob.polymarket.com/ws/market` **服务器会
 |:--|:--|:--|
 | `PING_INTERVAL` | 10s | websockets 协议级保活帧（喂服务器 keepalive）|
 | `PING_TIMEOUT` | 30s | 放宽防洪峰期 pong 延迟误杀 |
-| `RECV_TIMEOUT` | 15s | 单帧等待 |
+| `RECV_TIMEOUT` | **1s** | 单帧等待；**它同时是「订阅代」的检查间隔** —— 见下面 §7 的第一条限制 |
 | `DOWN_AFTER` | 60s | 无任何帧超此时长 → 判定连接 down |
 | `DEDUP_WIN` | 60s | 去重窗口 |
 | `DEDUP_MAX` | 40000 | 去重表上限 |
@@ -135,6 +135,7 @@ tail -5 /tmp/recorder_l2_v3.log   # 看 hb: 各线 "活2/2 gap0" 为健康; "活
 
 ## 7. 已知限制与结论
 
+- **旧连接不会产生新帧 ⇒ 换代检测必须靠超时兜底**：`conn_loop` 只在循环顶部比较 `my_gen < sub_gen`，而换市场那一刻连接正阻塞在 `recv()` 上；旧订阅（上一根 bar、已停牌）消息稀疏，所以要等到下一帧或 `RECV_TIMEOUT` 到点才会回到顶部。实测把 `RECV_TIMEOUT` 留在 15s 时，约 **45% 的 bar 要拖到 bar+10~14s 才有数据**（首帧偏移双峰 3s/13s，度量工具 `tools/l2_bar_coverage.py`）→ 故该常量须保持在 1s 量级。死链判定由 `DOWN_AFTER`（60s 无帧）负责，与它无关，调小不会误杀连接。
 - 服务器周期断是常态，双连接热备已把缺口降到 ~0（实测单连接断被另一条补，无 gap mark）
 - **禁止**再引入第二个写进程到同一 `l2_data`（曾因 watchdog 复活 v2 双写导致所有 gz 损坏 —— 排查法: `ps aux | grep recorder_l2` 是否多进程）
 - 读**正在写入**的 gz 会误报损坏（garbage/invalid block），须等 bar 关闭后再验证
