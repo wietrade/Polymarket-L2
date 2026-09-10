@@ -3,10 +3,17 @@ __pycache__/
 *.pyc
 *.pyo
 
-# 数据（L2 原始数据在 43 服务器，勿入库）
+# L2 原始数据（体积大、原始二进制；不入库）
+#   data/     本地工作区：packs/ 下载的日包 + <date>/ 解压结果 + manifest.json
+#   l2_data/  采集器在 43 上的落盘目录（若本地同步下来同样不入库）
+data/
 l2_data/
+*.tar.gz
+*.jsonl.gz
+.parts/
 archive_*/
 
-# 运行日志
+# 运行日志（本地产物）
+logs/
 watchdog.log
 watchdog_cron.log

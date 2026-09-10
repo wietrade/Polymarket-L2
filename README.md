@@ -3,9 +3,37 @@
 Polymarket BTC/ETH updown 5m & 15m 市场的 **L2 盘口 + 真实成交** 数据积累器。
 双连接热备方案，供研究重建盘口/成交/滑点使用。
 
+**本仓库同时是采集器源码库与本地数据工作区** —— 2026-09-11 由原来的 `polymarket-l2`（源码）
+与 `l2`（数据/工具）两个目录合并而成，代码与数据靠**子目录**分开，不再靠两个仓库分开。
+
 - **43 服务器（运行）**: `/www/wwwroot/polymarket-l2/`
-- **本地镜像**: `i:\plot\polymarket-l2\`
-- 数据红线提醒: 采集的 L2 原始数据 **勿删**（如要清理先与负责人确认）
+- **本地唯一目录**: `i:\plot\polymarket-l2\`（GitHub `wietrade/Polymarket-L2`）
+- 数据红线提醒: `data/` 下采集的 L2 原始数据 **勿删**（如要清理先与负责人确认）
+
+> 我只关心数据与下载工具 → 直接看 **[`docs/数据与工具.md`](docs/数据与工具.md)**
+> 我要改采集器 → 看本文 §5 部署与运维
+
+---
+
+## 0. 仓库布局
+
+```
+polymarket-l2/                     本地唯一目录 = GitHub wietrade/Polymarket-L2
+├── recorder_l2_dual.py    ★改     采集器主程序（v3 双连接热备，43 上跑的就是它）
+├── watchdog_l2.sh         ★改     cron 每分钟守护采集器
+├── dedup_check.py  gz_diag.py  ws_dual_test.py
+│                                  采集器配套验证工具
+├── tools/                        本地工具（下载 / 对账）
+│   ├── l2_get.py                 从 43 补拉日包 → sha256 校验 → 解压
+│   └── sync_program.sh           取回 43 运行版 sha256，核对是否漂移
+├── program/                      43 运行版**只读快照** + VERSIONS.txt 校验表
+├── data/                         数据（2284 文件 / 663MB；已 gitignore，勿手改）
+├── logs/                         本地产物（已 gitignore）
+└── docs/数据与工具.md             数据链路、下载命令、已知坑
+```
+
+改代码只改标了 ★ 的文件。`program/` 里那份 `recorder_l2_dual.py` 是从 43 取回的**运行版快照**，
+别在那里改 —— 一是改了会被下次 `sync_program.sh` 覆盖，二是它与根目录源码的差异正是"线上是否漂移"的证据。
 
 ---
 
@@ -121,3 +149,11 @@ tail -5 /tmp/recorder_l2_v3.log   # 看 hb: 各线 "活2/2 gap0" 为健康; "活
 # gz 结构诊断
 /www/wwwroot/polymarket/venv/bin/python gz_diag.py <file.gz>
 ```
+
+## 9. 相关文档
+
+- **数据链路 / 下载工具 / 已知坑**：[`docs/数据与工具.md`](docs/数据与工具.md)
+  （本地取数、`l2_get.py` 用法、sha256 对账、`program/` 快照与漂移核对）
+- 线上快照校验表：`program/VERSIONS.txt`（`cd program && sha256sum -c VERSIONS.txt`）
+- 待办与结论真源：`i:\plot\updown-live\docs\TODO-待办清单.md`
+- 记忆：`/memories/repo/recorder-l2-ws.md`

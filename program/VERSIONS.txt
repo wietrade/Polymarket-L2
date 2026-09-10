@@ -1,0 +1,8 @@
+# L2 program 快照校验表（由 sync_program.sh 生成）
+# 生成时间: 2026-09-11 00:05:56 +0800
+# 对应远端: root@43.165.167.132:/www/wwwroot/polymarket-l2 与 root@43.165.167.132:/www/wwwroot/ts_test/pmframe-v3/tools
+# 校验: cd program && sha256sum -c VERSIONS.txt
+4377fd4addf8a59c6ed592635a443e9fde2e737e4308ab811e9c9a785a6556fe  recorder_l2_dual.py
+453967f036b62352a0ba1c11181d64a20a70ddc365e5fd084ae5143ba0d56001  watchdog_l2.sh
+9cb726f01034569a1c40e53f996f89b4bd20b02b13caf96e82ac797e5e3e4b0c  pack/l2_pack.py
+ebf8d1d2d07d21d1aeeee5517183a7c13f3ec85977cb483ad95eaf23f990cb45  pack/l2_pack_publish.sh
