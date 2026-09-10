@@ -51,7 +51,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ROOT = os.path.join(os.path.dirname(HERE), "data")
 
 # 文件名: <coin>-updown-<cycle>-<bar_epoch>.jsonl.gz
-NAME_RE = re.compile(r"^(?P<coin>[a-z]+)-updown-(?P<cycle>\d+m)-(?P<epoch>\d+)\.jsonl\.gz$")
+NAME_RE = re.compile(
+    r"^(?P<coin>[a-z]+)-updown-(?P<cycle>\d+m)-(?P<epoch>\d+)\.jsonl\.gz$"
+)
 CYCLE_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600}
 
 
@@ -150,19 +152,25 @@ def group_and_report(files: list[str], by_hour: bool, detail: bool) -> None:
         lasts = [r["last"] for r in rs]
         covs = [r["last"] - r["first"] for r in rs]
         ok = sum(1 for f in firsts if f <= 10.0) / len(firsts) * 100
-        print(f"\n{date}  {coin} {cycle}  bars={len(rs)}  "
-              f"(主市场 book 行中位数 {int(_pct([r['book_rows'] for r in rs], 0.5)):,})")
-        print(f"  {'时刻':<10} {'bars':>5} {'首帧p50':>8} {'p90':>7} {'末帧p50':>8} "
-              f"{'覆盖p50':>8} {'≤10s':>7}")
+        print(
+            f"\n{date}  {coin} {cycle}  bars={len(rs)}  "
+            f"(主市场 book 行中位数 {int(_pct([r['book_rows'] for r in rs], 0.5)):,})"
+        )
+        print(
+            f"  {'时刻':<10} {'bars':>5} {'首帧p50':>8} {'p90':>7} {'末帧p50':>8} "
+            f"{'覆盖p50':>8} {'≤10s':>7}"
+        )
 
         def line(label: str, sub: list[dict]) -> None:
             if not sub:
                 return
             f = [r["first"] for r in sub]
             l = [r["last"] for r in sub]
-            print(f"  {label:<10} {len(sub):>5} {_pct(f,0.5):>8.1f} {_pct(f,0.9):>7.1f} "
-                  f"{_pct(l,0.5):>8.1f} {_pct([b-a for a,b in zip(f,l)],0.5):>8.1f} "
-                  f"{sum(1 for x in f if x<=10.0)/len(f)*100:>6.1f}%")
+            print(
+                f"  {label:<10} {len(sub):>5} {_pct(f, 0.5):>8.1f} {_pct(f, 0.9):>7.1f} "
+                f"{_pct(l, 0.5):>8.1f} {_pct([b - a for a, b in zip(f, l)], 0.5):>8.1f} "
+                f"{sum(1 for x in f if x <= 10.0) / len(f) * 100:>6.1f}%"
+            )
 
         if by_hour:
             buckets: dict[int, list[dict]] = defaultdict(list)
@@ -175,14 +183,18 @@ def group_and_report(files: list[str], by_hour: bool, detail: bool) -> None:
         # 与 bar 长度的关系：首帧偏移 > 90s 的占比（修复前典型形态）
         late = [r for r in rs if r["first"] > 90.0]
         if late:
-            print(f"  首帧 >90s 的 bar: {len(late)}/{len(rs)} = {len(late)/len(rs)*100:.1f}%"
-                  f"  （最晚 {max(r['first'] for r in late):.1f}s）")
+            print(
+                f"  首帧 >90s 的 bar: {len(late)}/{len(rs)} = {len(late) / len(rs) * 100:.1f}%"
+                f"  （最晚 {max(r['first'] for r in late):.1f}s）"
+            )
         if detail:
             print("  逐 bar:")
             for r in rs:
-                print(f"    {r['name']:<44} first={r['first']:>7.1f}s last={r['last']:>7.1f}s "
-                      f"cov={r['last']-r['first']:>6.1f}s book={r['book_rows']:>7,} "
-                      f"markets={r['markets_seen']}")
+                print(
+                    f"    {r['name']:<44} first={r['first']:>7.1f}s last={r['last']:>7.1f}s "
+                    f"cov={r['last'] - r['first']:>6.1f}s book={r['book_rows']:>7,} "
+                    f"markets={r['markets_seen']}"
+                )
 
     if empty:
         print(f"\n  无 book 行的文件 {len(empty)} 个（前 5）: {', '.join(empty[:5])}")
@@ -194,9 +206,15 @@ def group_and_report(files: list[str], by_hour: bool, detail: bool) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="统计 L2 每 bar 的首帧/末帧偏移与覆盖率")
-    ap.add_argument("--dir", default=DEFAULT_ROOT, help=f"数据根目录（默认 {DEFAULT_ROOT}）")
-    ap.add_argument("--date", action="append", required=True,
-                    help="日期目录名，如 2026-09-10；可重复传多次")
+    ap.add_argument(
+        "--dir", default=DEFAULT_ROOT, help=f"数据根目录（默认 {DEFAULT_ROOT}）"
+    )
+    ap.add_argument(
+        "--date",
+        action="append",
+        required=True,
+        help="日期目录名，如 2026-09-10；可重复传多次",
+    )
     ap.add_argument("--coin", action="append", help="只测某个币（btc/eth），可重复")
     ap.add_argument("--cycle", action="append", help="只测某个周期（5m/15m），可重复")
     ap.add_argument("--by-hour", action="store_true", help="再按 UTC 小时分组打印")
