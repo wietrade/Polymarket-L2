@@ -199,11 +199,16 @@ def extract(pkg: Path, root: Path) -> bool:
             names = tf.getnames()
         if not names:
             return False
-        top = names[0].split("/")[0]
-        if (root / top).exists():
+        tip = names[0].split("/")[0]
+        if (root / tip).exists():
             return True  # 视为已解压
         with tarfile.open(pkg, "r:gz") as tf:
-            tf.extractall(root)
+            try:
+                # filter="data"：只解普通文件/目录，挡绝对路径与符号链接
+                # （Python 3.12+ 支持；3.14 起为默认，不传会伐 DeprecationWarning）
+                tf.extractall(root, filter="data")
+            except TypeError:  # 老版本无 filter 参数
+                tf.extractall(root)
         return True
     except Exception as e:  # 损坏的包不该静默
         log(f"    ！解压失败 {pkg.name}: {type(e).__name__} {e}")
