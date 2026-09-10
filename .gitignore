@@ -1,0 +1,10 @@
+# 数据与日志不入库（数据体积大、且是原始采集件；日志是本地产物）
+data/
+logs/
+*.tar.gz
+*.jsonl.gz
+.parts/
+
+# 本地产物
+__pycache__/
+*.pyc
