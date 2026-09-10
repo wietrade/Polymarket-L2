@@ -54,7 +54,13 @@ GUARD_SOCK = None
 # 连接判定阈值
 PING_INTERVAL = 10.0  # 保活帧 (喂服务器 keepalive)
 PING_TIMEOUT = 30.0  # 放宽: 防洪峰期 pong 延迟导致误杀
-RECV_TIMEOUT = 15.0  # 单帧等待
+# 单帧等待 —— 它同时是「订阅代」的检查间隔: conn_loop 只在循环顶部比较
+# my_gen < sub_gen, 而换市场时连接正阻塞在 recv() 上, 只有收到下一帧(或超时)
+# 才会回到顶部 ⇒ 超时设 15s 时, 旧订阅(已停牌、消息稀疏)会让约 45% 的 bar
+# 拖到 bar+10~14s 才有数据(首帧偏移双峰 3s/13s, 度量: tools/l2_bar_coverage.py)。
+# 压到 1s ⇒ 换代检测延迟 ≤1s。注意: 死链判定由 DOWN_AFTER(60s 无帧)负责,
+# 与本超时无关, 所以调小不会误杀连接。
+RECV_TIMEOUT = 1.0
 DOWN_AFTER = 60.0  # 该时长无任何帧 → 视为该连接已 down
 CLOSE_DELAY = 30.0  # bar 切换后旧文件延迟关闭窗口 (吸收残留尾消息)
 DEDUP_WIN = 60.0  # 跨连接去重窗口秒
