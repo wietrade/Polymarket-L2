@@ -19,7 +19,9 @@ HOST=root@43.165.167.132
 SSH=(ssh -n -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=20 "$HOST")
 DEST="$(cd "$(dirname "$0")/.." && pwd)/program"
 SRC_L2=/www/wwwroot/polymarket-l2
-SRC_TOOLS=/www/wwwroot/ts_test/pmframe-v3/tools
+# 2026-09-11 修正：打包/发布脚本已归属本项目自身 tools/（原先借放 ts_test 的代码树，
+#   该树重排后路径失效 ⇒ 由 L2 项目接管，职责闭环）。
+SRC_TOOLS=/www/wwwroot/polymarket-l2/tools
 # 采集程序（43 的运行副本）+ 打包/发布脚本
 FILES_L2="recorder_l2_dual.py watchdog_l2.sh"
 FILES_TOOLS="l2_pack.py l2_pack_publish.sh"
