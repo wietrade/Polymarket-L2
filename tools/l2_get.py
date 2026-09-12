@@ -9,6 +9,10 @@
   **同一天的包会随数据增长被同名重打**（例如 09-10 的包在 19:32 生成、只覆盖到 19:30，
   凌晨 03:30 会被完整版覆盖）⇒ 只判存在会永久漏掉后半天的数据 ⇒ 一律按 sha256 判定。
 
+**解压一律是「合并」**（2026-09-12 修）：早期版本在「同名目录已存在」时直接当作"已解压"返回，
+  于是重下后的新增文件永远不落地（实测：09-10 少 144 个、09-08 少 91 个，且不报错）。
+  tar 解压本身幂等 ⇒ 直接覆盖式合并：既补新文件、也刷新被追加写过的老文件。
+
 用法：
   python tools/l2_get.py --list                    # 只列清单与本地状态，不下载
   python tools/l2_get.py                           # 补拉所有**已完成**的日包并解压
@@ -193,22 +197,30 @@ def download(
 
 
 def extract(pkg: Path, root: Path) -> bool:
-    """解压到 <root>/（tar 内顶层就是 <date>/）。已存在同名目录则跳过。"""
+    """把包**合并**解压到 <root>/（tar 内顶层就是 <date>/）。
+
+    为什么必须合并，而不能「同名目录已存在就跳过」（2026-09-12 修复）：
+      同一天的包会随数据增长被**同名重打**（当天包最后一根 bar 还在写、前一天会被补包）。
+      sha256 变了会重新下载，但若解压时因「目录已存在」直接返回，
+      **新增的那部分文件永远不会落地、而且完全不报错**。
+      实测代价：09-10 因此少 144 个文件、09-08 少 91 个（都只能人工发现）。
+      tar 解压本身是幂等的覆盖写 ⇒ 直接合并解压：既补新文件、也刷新被追加写过的老文件。
+    """
     try:
         with tarfile.open(pkg, "r:gz") as tf:
-            names = tf.getnames()
-        if not names:
-            return False
-        tip = names[0].split("/")[0]
-        if (root / tip).exists():
-            return True  # 视为已解压
-        with tarfile.open(pkg, "r:gz") as tf:
+            members = tf.getmembers()  # 读一遍成员表（缓存，后面 extractall 不再重读）
+            if not members:
+                return False
+            new = sum(1 for m in members if m.isfile() and not (root / m.name).exists())
+            nfile = sum(1 for m in members if m.isfile())
+            old = nfile - new
             try:
                 # filter="data"：只解普通文件/目录，挡绝对路径与符号链接
                 # （Python 3.12+ 支持；3.14 起为默认，不传会伐 DeprecationWarning）
                 tf.extractall(root, filter="data")
             except TypeError:  # 老版本无 filter 参数
                 tf.extractall(root)
+            log(f"    合并解压 {nfile} 个文件（新增 {new} / 覆盖刷新 {old}）")
         return True
     except Exception as e:  # 损坏的包不该静默
         log(f"    ！解压失败 {pkg.name}: {type(e).__name__} {e}")
@@ -250,6 +262,13 @@ def main() -> int:
         return 2
     files = man.get("files") or []
     gen = man.get("generated") or 0
+    # 本地留一份清单副本（便于离线对账/回溯；模块 docstring 承诺的 <root>/manifest.json）
+    try:
+        (root / "manifest.json").write_text(
+            json.dumps(man, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+    except OSError as e:
+        log(f"  ！写本地 manifest 失败: {type(e).__name__} {e}")
     log(
         f"远端清单生成于 {dt.datetime.fromtimestamp(gen):%Y-%m-%d %H:%M:%S}，共 {len(files)} 个包"
     )
@@ -278,7 +297,12 @@ def main() -> int:
             got = sha256_of(dest)
             if want and got == want:
                 uptodate += 1
-                if not a.no_extract and not (root / day).exists():
+                if not a.no_extract and not a.list:
+                    # 合并解压（不再假设「目录在 = 已解压」）：
+                    # ① 当天包会被同名重打 ⇒ 目录在也可能缺新文件；
+                    # ② 本地目录可能被人工动过 ⇒ 按包内容补齐。
+                    # 幂等且只几秒，比静默漏数据便宜得多（2026-09-12 修）。
+                    # `--list` 是「只列状态」⇒ 不写盘。
                     extract(dest, root)
                 continue
             log(f"  需重下（sha 不一致）: {name}")
