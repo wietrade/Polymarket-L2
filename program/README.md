@@ -8,7 +8,7 @@
 | 快照文件 | 可编辑源头 | 怎么部署上去 |
 |:---|:---|:---|
 | `recorder_l2_dual.py`、`watchdog_l2.sh` | `i:\plot\polymarket-l2\`（GitHub `wietrade/Polymarket-L2`） | 推该仓库的 main，再同步到 43 |
-| `pack/l2_pack.py`、`pack/l2_pack_publish.sh` | `i:\plot\updown-live\pmframe-v3\tools\` | `bash updown-live/tools/srv_sync.sh push` |
+| `pack/l2_pack.py`、`pack/l2_pack_publish.sh` | ⚠️ **目前没有**（原 `i:\plot\updown-live\pmframe-v3\tools\` 已于 2026-09-12 归档删除） | 待定：建议把它们提升到本仓库 `tools/` 下作为可编辑源 + 一个部署脚本（见 `../docs/数据与工具.md` §5） |
 
 改完源头、部署完 43 之后，跑一次 `sync_program.sh` 更新本目录与校验表，
 这样"快照 = 线上"始终成立。
