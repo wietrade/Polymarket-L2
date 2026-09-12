@@ -31,6 +31,19 @@ import sys
 
 import polars as pl
 
+# 跨 (币, 周期, 时点) 的汇总累加器：{spread 桶: [n, wins, Σroi, Σroi_fee]}
+# 为什么要它：单组合的宽价差档只有几十笔 ⇒ 必须把 6 天 ×2 币 ×2 周期 ×多个时点并起来才够看
+_POOL: dict = {}
+
+
+def _pool_add(lo: float, hi: float, n: int, wins: int, roi_sum: float, fee_sum: float) -> None:
+    a = _POOL.setdefault((lo, hi), [0, 0, 0.0, 0.0])
+    a[0] += n
+    a[1] += wins
+    a[2] += roi_sum
+    a[3] += fee_sum
+
+
 BUCKETS = [(0.0, 0.011), (0.011, 0.021), (0.021, 0.031), (0.031, 0.051), (0.051, 9.9)]
 CUM = [0.011, 0.021, 0.031, 0.051, 9.9]
 
@@ -56,17 +69,18 @@ def _one_partition(qpath: str, bt: pl.DataFrame, offset: int) -> pl.DataFrame:
     q = q.filter(pl.col("ts_ms") <= pl.col("t_target"))
     q = q.sort(["market", "asset_id", "ts_ms"]).group_by(["market", "asset_id"]).last()
     # 每个市场取两侧，mid 高者为领跑方
+    # 领跑方判定（2026-09-12 放宽）：两侧都有 ⇒ 取 mid 高者；**只有一侧** ⇒ 该侧 mid>0.5 才算领跑方
+    #   （原实现硬性要求两侧都有 ⇒ 3355 个市场里只用上 526 个，宽价差档样本被砍到几十）
     w = (
         q.group_by("market")
         .agg([
             pl.col("asset_id").get(pl.col("mid").arg_max()).alias("lead_asset"),
             pl.col("mid").max().alias("lead_mid"),
-            pl.col("mid").min().alias("other_mid"),
             pl.col("spread").get(pl.col("mid").arg_max()).alias("lead_spread"),
             pl.col("best_ask").get(pl.col("mid").arg_max()).alias("lead_ask"),
             pl.len().alias("n_sides"),
         ])
-        .filter(pl.col("n_sides") == 2)
+        .filter((pl.col("n_sides") == 2) | (pl.col("lead_mid") > 0.5))
     )
     # ⚠️ w 是 LazyFrame、bt 是 DataFrame ⇒ 必须 .lazy() 才能 join（自检走的是 DataFrame 版
     #   同逻辑函数，没覆盖这条管线 ⇒ 首次真实运行才暴露；记在提交信息里）
@@ -111,6 +125,7 @@ def _report(df: pl.DataFrame, label: str) -> None:
         print("   %-14s %7d %7.1f%% %8.3f %+10.4f %+10.4f"
               % ("[%.3f,%.3f)" % (lo, hi), sub.height, w / sub.height * 100,
                  sub["lead_ask"].mean(), roi, roi_fee))
+        _pool_add(lo, hi, sub.height, int(w), roi * sub.height, roi_fee * sub.height)
     print("   ── 累积（spread ≤ T）──")
     for T in CUM:
         sub = df.filter(pl.col("lead_spread") <= T)
@@ -149,6 +164,7 @@ def main() -> int:
     ap.add_argument("--cycles", default="5m")
     ap.add_argument("--offset", type=int, default=60, help="入场时刻 = bar_ts + offset 秒")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--days", default=None, help="只取这些日（逗号分隔，如 2026-09-11,2026-09-12）")
     a = ap.parse_args()
 
     if a.selftest:
@@ -188,7 +204,12 @@ def main() -> int:
     bt = pl.read_parquet(os.path.join(a.derived, "bar_tokens.parquet"))
     for coin in [c.strip() for c in a.coins.split(",") if c.strip()]:
         for cycle in [c.strip() for c in a.cycles.split(",") if c.strip()]:
-            parts = sorted(glob.glob(os.path.join(a.derived, "quotes", "day=*", "coin=" + coin, "cycle=" + cycle, "*.parquet")))
+            daypat = "day=*"
+            parts = []
+            days = [d.strip() for d in a.days.split(",")] if a.days else None
+            for dd in (days or ["*"]):
+                parts += sorted(glob.glob(os.path.join(a.derived, "quotes", "day=" + dd,
+                                                       "coin=" + coin, "cycle=" + cycle, "*.parquet")))
             if not parts:
                 print("(无数据 %s %s)" % (coin, cycle))
                 continue
@@ -202,6 +223,17 @@ def main() -> int:
                 continue
             df = pl.concat(frames)
             _report(df, "%s-%s（offset=bar+%ds）" % (coin, cycle, a.offset))
+    if _POOL:
+        print("=" * 88)
+        print("== 汇总（跨 币 × 周期 × 时点 全部合并）==")
+        print("   %-14s %8s %8s %10s %10s" % ("spread 区间", "n", "胜率%", "ROI/单", "ROI/单(含费)"))
+        for (lo, hi) in sorted(_POOL):
+            n, win, roi_sum, fee_sum = _POOL[(lo, hi)]
+            if not n:
+                continue
+            print("   %-14s %8d %7.1f%% %+10.4f %+10.4f"
+                  % ("[%.3f,%.3f)" % (lo, hi), n, win / n * 100, roi_sum / n, fee_sum / n))
+        print("   （n<30 不足以裁决；<500 未达门槛 —— 按本项目规矩标注后再读）")
     return 0
 
 
