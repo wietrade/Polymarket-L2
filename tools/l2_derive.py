@@ -21,7 +21,8 @@
 口径（重要，别混）：
   · ts_ms  = 帧内 `timestamp` 字段，ms epoch，**UTC**，不做时区转换
   · from_ts/to_ts/marks = **epoch 秒**（recorder 的 wall clock），不是 ms
-  · best_bid = bids[-1]（bids 升序）、best_ask = asks[0]（asks 降序）—— 实测 0 例外
+  · best_bid / best_ask = 档位里的**最高买价 / 最低卖价**（用 `_best()` 按价格取，**与数组排序无关**）。
+    ⚠️ 2026-09-12 修正：原按索引取 `bids[-1]`/`asks[0]`，因把「哪端是最优」判反而把 `best_ask` 取成最差卖价。
   · side: 1=UP / 0=DOWN / -1=未知（gamma 没查到，或 outcomes 不是 ["Up","Down"]）
   · is_primary: 1 = 该行 market 等于本文件的主市场；0 = 相邻轮次残留，其 slug/bar_ts 不代表该行
   · 归因一律用 market + asset_id，别用文件名
@@ -147,6 +148,28 @@ def fnum(x):
     except (TypeError, ValueError):
         return None
 
+
+
+def _best(levels, take_max: bool):
+    """从 book 档位取**最优价**与其 size —— **与数组排序无关**。
+
+    ⚠️ 2026-09-12 修正（真 bug）：原实现按索引取 `bids[-1]` / `asks[0]`，注释写「bids 升序、asks 降序，
+    实测 0 例外」。**排序确实单调，但「哪一端是最优价」判反了** —— 原始帧实测（data/2026-09-12/*.jsonl.gz）：
+        bids: 0.01 → 0.02 → … → 0.49 → **0.50**（升序，最优在**尾**）
+        asks: 0.99 → 0.98 → … → 0.52 → **0.51**（降序，最优在**尾**）
+    ⇒ `asks[0]` 取到 **0.99 = 最差卖价**，派生层的 `best_ask` / `mid` / `spread` **三列全错**
+    （`best_bid` 恰好取对了 ⇒ 只坏一半、更难察觉）。教训：**索引口径只验证了单调性，没验证语义**。
+    """
+    best = None
+    for x in levels or []:
+        if not isinstance(x, dict):
+            continue
+        px = fnum(x.get("price"))
+        if px is None:
+            continue
+        if best is None or (px > best[0] if take_max else px < best[0]):
+            best = (px, fnum(x.get("size")))
+    return best if best else (None, None)
 
 def inum(x, default=None):
     if x is None or x == "":
@@ -582,8 +605,8 @@ def stage_tables(files, meta, out, base=None, quiet=False):
                 if et == "book":
                     bids = r.get("bids") or []
                     asks = r.get("asks") or []
-                    bb = fnum(bids[-1]["price"]) if bids else None
-                    ba = fnum(asks[0]["price"]) if asks else None
+                    bb, bsz = _best(bids, True)
+                    ba, asz = _best(asks, False)
                     side = tok2side.get(aid, -1)
                     if side == -1:
                         unknown_tokens[aid] = unknown_tokens.get(aid, 0) + 1
@@ -595,9 +618,9 @@ def stage_tables(files, meta, out, base=None, quiet=False):
                         "asset_id": aid,
                         "side": side,
                         "best_bid": bb,
-                        "best_bid_sz": fnum(bids[-1]["size"]) if bids else None,
+                        "best_bid_sz": bsz,
                         "best_ask": ba,
-                        "best_ask_sz": fnum(asks[0]["size"]) if asks else None,
+                        "best_ask_sz": asz,
                         "mid": (bb + ba) / 2
                         if (bb is not None and ba is not None)
                         else None,
@@ -768,12 +791,9 @@ def sample_compare(files, out, base=None, n_sample=8, seed=20260912):
                 i = qidx[k]
                 bids = r.get("bids") or []
                 asks = r.get("asks") or []
-                exp = (
-                    fnum(bids[-1]["price"]) if bids else None,
-                    fnum(asks[0]["price"]) if asks else None,
-                    len(bids),
-                    len(asks),
-                )
+                _bb, _ = _best(bids, True)
+                _ba, _ = _best(asks, False)
+                exp = (_bb, _ba, len(bids), len(asks))
                 act = (
                     qd["best_bid"][i],
                     qd["best_ask"][i],
@@ -834,6 +854,13 @@ def stage_verify(files, meta, out, base=None):
 # 离线自检
 # --------------------------------------------------------------------------
 def self_test():
+    # Windows 控制台默认 GBK ⇒ 打印 −/⇒/→ 之类的字符会 UnicodeEncodeError 崩在自检中途
+    # （2026-09-12 实测：一条含 U+2212 的断言标签直接把 self-test 打崩）。Linux 本就是 UTF-8，无副作用。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     import shutil
     import tempfile
 
@@ -857,8 +884,17 @@ def self_test():
                 "timestamp": "1789000005000",
                 "hash": "h1",
                 "event_type": "book",
-                "bids": [{"price": "0.40", "size": "10"}],
-                "asks": [{"price": "0.44", "size": "5"}],
+                # ⚠️ 2026-09-12：改成**多档 + 真实帧排列** —— 买价升序、卖价降序（最优都在**最后**）。
+                #   原夹具是单档书（bids[0.40]、asks[0.44]）⇒ 取头取尾都一样 ⇒ **永远抓不到
+                #   「asks[0] 取了最差卖价」那个 bug**（自检把错误假设编了进去）。现在老代码会给 0.48 ⇒ 必红。
+                "bids": [
+                    {"price": "0.38", "size": "4"},
+                    {"price": "0.42", "size": "10"},
+                ],
+                "asks": [
+                    {"price": "0.48", "size": "3"},
+                    {"price": "0.44", "size": "5"},
+                ],
             },
             {
                 "market": "0xM1",
@@ -1035,23 +1071,23 @@ def self_test():
         )
         i_latest = ups[-1]
         check(
-            "最新一行 best_bid=0.40（取最后一档=最优买价口径）",
-            q["best_bid"][i_latest] == 0.40,
+            "最新一行 best_bid=0.42（= 买价里的最高价，与数组顺序无关）",
+            q["best_bid"][i_latest] == 0.42,
             str(q["best_bid"][i_latest]),
         )
         check(
-            "最新一行 best_ask=0.44",
+            "最新一行 best_ask=0.44（= 卖价里的最低价；老实现取 asks[0] 会给 0.48）",
             q["best_ask"][i_latest] == 0.44,
             str(q["best_ask"][i_latest]),
         )
         check(
-            "最新一行 spread=0.04（不含手续费、未取整口径）",
-            abs(q["spread"][i_latest] - 0.04) < 1e-12,
+            "最新一行 spread=0.02（0.44−0.42；不含手续费）",
+            abs(q["spread"][i_latest] - 0.02) < 1e-12,
             str(q["spread"][i_latest]),
         )
         check(
-            "最新一行 mid=0.42",
-            abs(q["mid"][i_latest] - 0.42) < 1e-12,
+            "最新一行 mid=0.43",
+            abs(q["mid"][i_latest] - 0.43) < 1e-12,
             str(q["mid"][i_latest]),
         )
         i_early = ups[0]
