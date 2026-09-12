@@ -170,8 +170,10 @@ def main(argv=None):
     agree = (r["pred"] == r["winner"]).mean()
     bad = r[r["pred"] != r["winner"]]
 
-    print("样本 bar: %d（跳过：末段无数据 %d / 无 bar 窗口 %d / 窗口内两侧都无 bid %d）"
-          % (len(r), skipped["no_cover"], skipped["no_window"], skipped["no_bid"]))
+    print(
+        "样本 bar: %d（跳过：末段无数据 %d / 无 bar 窗口 %d / 窗口内两侧都无 bid %d）"
+        % (len(r), skipped["no_cover"], skipped["no_window"], skipped["no_bid"])
+    )
     print("一致率: %.2f%%（官方 winner vs 末段 bid 判据）" % (agree * 100))
     for lab in ("UP", "DOWN"):
         s = r[r["winner"] == lab]
