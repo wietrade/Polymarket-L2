@@ -23,13 +23,15 @@ polymarket-l2/                     本地唯一目录 = GitHub wietrade/Polymark
 ├── watchdog_l2.sh         ★改     cron 每分钟守护采集器
 ├── dedup_check.py  gz_diag.py  ws_dual_test.py
 │                                  采集器配套验证工具
-├── tools/                        本地工具（下载 / 对账）
-│   ├── l2_get.py                 从 43 补拉日包 → sha256 校验 → 解压
+├── tools/                        本地工具（下载 / 派生 / 对账）
+│   ├── l2_get.py                 从 43 补拉日包 → sha256 校验 → 合并解压
+│   ├── l2_derive.py              原始 gz → 派生表（侧别映射 + 顶档/成交/gap）+ 离线自检 + 双侧校验
+│   ├── l2_bar_coverage.py        每 bar 首帧/覆盖秒数统计
 │   └── sync_program.sh           取回 43 运行版 sha256，核对是否漂移
 ├── program/                      43 运行版**只读快照** + VERSIONS.txt 校验表
-├── data/                         数据（2284 文件 / 663MB；已 gitignore，勿手改）
+├── data/                         数据（原始 2284 文件 / 663MB + derived/ 派生表；已 gitignore，勿手改）
 ├── logs/                         本地产物（已 gitignore）
-└── docs/数据与工具.md             数据链路、下载命令、已知坑
+└── docs/数据与工具.md             数据链路、下载命令、已知坑；派生表口径见同目录《派生表-口径.md》
 ```
 
 改代码只改标了 ★ 的文件。`program/` 里那份 `recorder_l2_dual.py` 是从 43 取回的**运行版快照**，
