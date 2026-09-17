@@ -17,22 +17,12 @@
 
 用法：
   python tools/l2_get.py --list                    # 只列清单与本地状态，不下载
-  python tools/l2_get.py                           # 补拉所有**已完成**的包并解压
-  python tools/l2_get.py --jobs 24                 # 加大并发（实测这条路由单连 接被限速）
-  python tools/l2_get.py --include-today           # 连还在长的包也拉（当前小时/当天，慎用）
-  python tools/l2_get.py --hours 24                # 只看最近 24 小时的包
-  python tools/l2_get.py --mode day --days 3       # 只拉日包（历史全量补拉）
+  python tools/l2_get.py                           # 补拉所有**已完成**的日包并解压
+  python tools/l2_get.py --jobs 24                 # 加大并发（实测这条路由单连接被限速）
+  python tools/l2_get.py --include-today           # 连当天的包也拉（当天还会变，慎用）
+  python tools/l2_get.py --days 3                  # 只关心最近 3 天
   python tools/l2_get.py --no-extract              # 只下压缩包，不解压
-  python tools/l2_get.py --dir I:/plot/l2/data     # 指定数据根目录（默认 <项目 根>/data）
-
-粒度：谁在清单里就拉谁（2026-09-17 改成按小时）
-  服务端现在同时发布 **小时包** `l2_<date>T<HH>.tar.gz`（≈12MB）与 **日包**
-  `l2_<date>.tar.gz`（≈215MB）。默认 `--mode auto`：清单里**有小时包就用小时包**。
-  ⇒ 只缺 3 小时就只下 3 个小时包，不再为了 3 小时搬一整天。
-  小时口径 = **UTC**（与 `data/<date>/` 日目录同口径）；包内顶层仍是 `<date>/`
-  ⇒ 解压是**合并**到同一棵树，两套包不会分叉。
-  判「要不要拉」一律按 **sha256**：同名包会被重打（当前小时/当天还在长），
-  只看“文件在不在”会永久漏掉后半段（2026-09-12 实测：09-10 少 144 个文件）。
+  python tools/l2_get.py --dir I:/plot/l2/data     # 指定数据根目录（默认 <项目根>/data）
 
 目录布局（数据与代码分离，数据不入口 git 仓库）：
   <root>/packs/l2_<date>.tar.gz        下载的包（+ .sha256）
@@ -43,7 +33,6 @@
 from __future__ import annotations
 
 import argparse
-import calendar
 import datetime as dt
 import hashlib
 import json
@@ -240,276 +229,15 @@ def extract(pkg: Path, root: Path) -> bool:
         return False
 
 
-def hour_of_file(fname: str) -> str:
-    """文件名 → UTC 小时键（与 43 上 `l2_pack.py` 的 `hour_of` 同一口径）。"""
-    m = re.match(r"^(?:btc|eth)-updown-(?:5m|15m)-(\d+)\.jsonl\.gz$", fname)
-    if not m:
-        return ""
-    return time.strftime("%Y-%m-%dT%H", time.gmtime(int(m.group(1))))
-
-
-def parse_pack(name: str) -> dict | None:
-    """包名 → 描述（`hour` / `day`）。认不出来返回 None（**报出来，不静默丢**）。
-
-    小时口径 = UTC，与 `data/<date>/` 日目录同口径。包内顶层始终是 `<date>/`，
-    所以两套包解压到同一棵树是**合并**、不会分叉。
-    """
-    mh = re.match(r"^l2_(\d{4}-\d{2}-\d{2})T(\d{2})\.tar\.gz$", name)
-    if mh:
-        day, hh = mh.group(1), mh.group(2)
-        try:
-            # 用 calendar.timegm（UTC 语义），不用 time.mktime（本地时区，会差 8 小时）
-            start = calendar.timegm(time.strptime(day + hh, "%Y-%m-%d%H"))
-        except ValueError:
-            start = 0
-        return {"kind": "hour", "day": day, "hkey": day + "T" + hh, "start": start}
-    md = re.match(r"^l2_(\d{4}-\d{2}-\d{2})\.tar\.gz$", name)
-    if md:
-        return {"kind": "day", "day": md.group(1), "hkey": "", "start": 0}
-    return None
-
-
-def local_files_for(root: Path, info: dict) -> int:
-    """本地已落地的、属于该包的文件数（用于与清单里的 `nfiles` 对账）。
-
-    为什么要有这个数：解压是**合并**的、失败只打一行日志 ⇒
-    “包里该有 12 个文件、本地只落了 9 个”这种半截状态必须能自己发现
-    （2026-09-17 就是被这种半截状态骗过：本地 09-16 的原始文件被采集器截断）。
-    """
-    d = root / info["day"]
-    if not d.is_dir():
-        return 0
-    if info["kind"] == "day":
-        return sum(1 for p in d.iterdir() if p.is_file())
-    return sum(
-        1 for p in d.iterdir() if p.is_file() and hour_of_file(p.name) == info["hkey"]
-    )
-
-
-def select_packs(
-    parsed: list[dict],
-    mode: str,
-    hours: int,
-    days: int,
-    include_unfinished: bool,
-    now: int,
-    today: str,
-) -> tuple[list[dict], list[str], list[str]]:
-    """从清单里选出**这次要考虑的包**（纯函数，不碰盘 ⇒ 可离线自检）。
-
-    三道筛：① 粒度（mode）② 窗口（hours/days）③ 服务端说“还没长完”的跳过。
-    返回 (候选, 跳过的未完成包名, 因窗口被排除的包名)——排除项也要能看到，
-    否则“为什么没拉这个小时”只能猜。
-    """
-    nh = [x for x in parsed if x["kind"] == "hour"]
-    nd = [x for x in parsed if x["kind"] == "day"]
-    if mode == "auto":
-        mode = "hour" if nh else "day"
-    pool = {"hour": nh, "day": nd, "all": parsed}[mode]
-    cut_day = (
-        (dt.date.fromisoformat(today) - dt.timedelta(days=days - 1)).isoformat()
-        if days
-        else ""
-    )
-    cands, unfinished, windowed = [], [], []
-    for x in pool:
-        name = str(x["entry"].get("name") or "")
-        if x["kind"] == "hour":
-            if hours and x["start"] and x["start"] < now - hours * 3600:
-                windowed.append(name)
-                continue
-        elif cut_day and x["day"] < cut_day:
-            windowed.append(name)
-            continue
-        # `final` 由服务端清单给；**老清单没这个字段时退回到旧规则**
-        # （日包的当天包仍然跳过），否则会㿝成“当天包每次重拉 215MB”。
-        fin = x["entry"].get("final")
-        if fin is None:
-            fin = not (x["kind"] == "day" and x["day"] == today)
-        if not fin and not include_unfinished:
-            unfinished.append(name)
-            continue
-        cands.append(x)
-    return cands, unfinished, windowed
-
-
-def selftest() -> int:
-    """离线自检（不联网、不碰生产数据）：命名即断言、失败退出码非 0。"""
-    import tempfile
-
-    fails: list[str] = []
-
-    def chk(name: str, cond: bool) -> None:
-        print(("  OK   " if cond else "  FAIL ") + name)
-        if not cond:
-            fails.append(name)
-
-    print("[1] 包名解析")
-    h = parse_pack("l2_2026-09-16T04.tar.gz")
-    chk(
-        "小时包解析出 kind/day/hkey",
-        h is not None and h["kind"] == "hour" and h["hkey"] == "2026-09-16T04",
-    )
-    # 1789529400 = 2026-09-16 03:30Z（手算+实测过）；小时起点 = 1789527600
-    chk(
-        "小时起点是 UTC 口径（1789527600），不是本地时区的差 8 小时",
-        parse_pack("l2_2026-09-16T03.tar.gz")["start"] == 1789527600,
-    )
-    d = parse_pack("l2_2026-09-16.tar.gz")
-    chk(
-        "日包解析出 kind=day",
-        d is not None and d["kind"] == "day" and d["day"] == "2026-09-16",
-    )
-    chk(
-        "手工包/怪名 -> None（不静默当包处理）",
-        parse_pack("l2_full.tar.gz") is None
-        and parse_pack("l2_2026-09-16T4.tar.gz") is None,
-    )
-
-    print("[2] 文件名 -> 小时键")
-    chk("5m 文件", hour_of_file("btc-updown-5m-1789529400.jsonl.gz") == "2026-09-16T03")
-    chk(
-        "15m 文件同一口径",
-        hour_of_file("eth-updown-15m-1789529400.jsonl.gz") == "2026-09-16T03",
-    )
-    chk("不规范名 -> 空串（不计入任何小时）", hour_of_file("weird.jsonl.gz") == "")
-
-    print("[3] 粒度/窗口/未完成 三道筛")
-
-    def ent(name, final=True, sha="a"):
-        return {
-            "name": name,
-            "sha256": sha,
-            "final": final,
-            "size": 1000,
-            "kind": "hour" if "T" in name else "day",
-        }
-
-    now = 1789529400  # 2026-09-16T03:30Z
-    parsed = [
-        dict(parse_pack(n), entry=ent(n))
-        for n in (
-            "l2_2026-09-16T03.tar.gz",
-            "l2_2026-09-16T04.tar.gz",
-            "l2_2026-09-15T23.tar.gz",
-            "l2_2026-09-16.tar.gz",
-            "l2_2026-09-15.tar.gz",
-        )
-    ]
-    c, u, w = select_packs(parsed, "auto", 0, 0, False, now, "2026-09-16")
-    chk(
-        "auto + 清单里有小时包 -> 只考虑小时包（3 个），日包不捎带",
-        len(c) == 3 and all(x["kind"] == "hour" for x in c),
-    )
-    c, u, w = select_packs(parsed, "auto", 2, 0, False, now, "2026-09-16")
-    chk(
-        "--hours 2 -> 只留最近 2 小时（04 与 03），23 那个被窗口排除且被记名",
-        sorted(x["hkey"] for x in c) == ["2026-09-16T03", "2026-09-16T04"]
-        and w == ["l2_2026-09-15T23.tar.gz"],
-    )
-    c, u, w = select_packs(parsed, "day", 0, 0, False, now, "2026-09-16")
-    chk(
-        "mode=day -> 只看日包（2 个）",
-        len(c) == 2 and all(x["kind"] == "day" for x in c),
-    )
-    parsed2 = [
-        dict(
-            parse_pack("l2_2026-09-16T04.tar.gz"),
-            entry=ent("l2_2026-09-16T04.tar.gz", final=False),
-        ),
-        dict(
-            parse_pack("l2_2026-09-16T03.tar.gz"), entry=ent("l2_2026-09-16T03.tar.gz")
-        ),
-    ]
-    c, u, w = select_packs(parsed2, "hour", 0, 0, False, now, "2026-09-16")
-    chk(
-        "未标 final 的（当前小时）默认跳过，且被记名",
-        [x["hkey"] for x in c] == ["2026-09-16T03"]
-        and u == ["l2_2026-09-16T04.tar.gz"],
-    )
-    c, u, w = select_packs(parsed2, "hour", 0, 0, True, now, "2026-09-16")
-    chk("--include-today -> 未完成的也纳入", len(c) == 2 and u == [])
-    c, u, w = select_packs(
-        [x for x in parsed if x["kind"] == "day"],
-        "auto",
-        0,
-        0,
-        False,
-        now,
-        "2026-09-16",
-    )
-    chk("清单里没有小时包 -> auto 回退到日包（老行为不变）", len(c) == 2)
-    c, u, w = select_packs([], "auto", 0, 0, False, now, "2026-09-16")
-    chk(
-        "空清单 -> 不报错、返回空（调用方会打印“待补 0”）",
-        c == [] and u == [] and w == [],
-    )
-
-    print("[4] 本地文件数对账")
-    tmp = Path(tempfile.mkdtemp(prefix="l2get-st"))
-    try:
-        os_d = tmp / "2026-09-16"
-        os_d.mkdir(parents=True)
-        for n in (
-            "btc-updown-5m-1789529400.jsonl.gz",
-            "eth-updown-5m-1789529460.jsonl.gz",
-            "btc-updown-5m-1789531200.jsonl.gz",
-        ):
-            (os_d / n).write_bytes(b"")
-        chk(
-            "小时包：只数属于该小时的文件（03 点 2 个、04 点 1 个）",
-            local_files_for(
-                tmp, {"kind": "hour", "day": "2026-09-16", "hkey": "2026-09-16T03"}
-            )
-            == 2
-            and local_files_for(
-                tmp, {"kind": "hour", "day": "2026-09-16", "hkey": "2026-09-16T04"}
-            )
-            == 1,
-        )
-        chk(
-            "日包：数该日目录全部文件",
-            local_files_for(tmp, {"kind": "day", "day": "2026-09-16", "hkey": ""}) == 3,
-        )
-        chk(
-            "目录不存在 -> 0（不抛异常）",
-            local_files_for(tmp, {"kind": "hour", "day": "2000-01-01", "hkey": "x"})
-            == 0,
-        )
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-    print()
-    if fails:
-        print("自检失败 %d 项：%s" % (len(fails), "; ".join(fails)))
-        return 1
-    print("自检全部通过")
-    return 0
-
-
 def main() -> int:
-    ap = argparse.ArgumentParser(description="L2 包补拉 + 解压（按小时为主）")
+    ap = argparse.ArgumentParser(description="L2 日包补拉 + 解压")
     ap.add_argument("--base", default=DEFAULT_BASE, help="服务基址（默认 43:8001）")
     ap.add_argument(
         "--dir", default=None, help="数据根目录（默认 <workspace>/l2_data）"
     )
+    ap.add_argument("--days", type=int, default=0, help="只处理最近 N 天（0=全部）")
     ap.add_argument(
-        "--days", type=int, default=0, help="只处理最近 N 天的**日包**（0=全部）"
-    )
-    ap.add_argument(
-        "--hours",
-        type=int,
-        default=0,
-        help="只处理最近 N 小时的**小时包**（0=清单里有的都算）",
-    )
-    ap.add_argument(
-        "--mode",
-        choices=("auto", "hour", "day", "all"),
-        default="auto",
-        help="auto=清单里有小时包就用小时包，否则用日包",
-    )
-    ap.add_argument(
-        "--include-today", action="store_true", help="连还在长的包也拉（当前小时/当天）"
+        "--include-today", action="store_true", help="连当天的包也拉（当天会变）"
     )
     ap.add_argument("--no-extract", action="store_true", help="只下载，不解压")
     ap.add_argument("--list", action="store_true", help="只列状态，不下载")
@@ -521,10 +249,7 @@ def main() -> int:
         help="并发分片数（默认 12；实测这条路由单连接仅 9~30KB/s，并发能绕开）",
     )
     ap.add_argument("--chunk-mb", type=int, default=4, help="分片大小 MB（默认 4）")
-    ap.add_argument("--selftest", action="store_true", help="离线自检（不联网）")
     a = ap.parse_args()
-    if a.selftest:
-        return selftest()
 
     # 本例默认数据根 = <项目根>/data（本文件位于 <项目根>/tools/ 下）
     root = Path(a.dir) if a.dir else Path(__file__).resolve().parents[1] / "data"
@@ -550,81 +275,57 @@ def main() -> int:
         f"远端清单生成于 {dt.datetime.fromtimestamp(gen):%Y-%m-%d %H:%M:%S}，共 {len(files)} 个包"
     )
 
-    parsed, unrecognized = [], []
+    DAY_RE = re.compile(r"^l2_(\d{4}-\d{2}-\d{2})\.tar\.gz$")
+    today = dt.date.today().isoformat()
+    todo, uptodate, skipped = [], 0, 0
     for f in files:
         name = str(f.get("name") or "")
-        info = parse_pack(name)
-        if info is None:
-            unrecognized.append(name)
+        m = DAY_RE.match(name)
+        if not m:
+            continue  # l2_full.tar.gz 等手工包不自动拉（要的话手动 curl）
+        day = m.group(1)
+        if (
+            a.days
+            and day < (dt.date.today() - dt.timedelta(days=a.days - 1)).isoformat()
+        ):
             continue
-        info["entry"] = f
-        parsed.append(info)
-    nh = [x for x in parsed if x["kind"] == "hour"]
-    nd = [x for x in parsed if x["kind"] == "day"]
-    eff_mode = a.mode if a.mode != "auto" else ("hour" if nh else "day")
-    log(f"清单：小时包 {len(nh)} / 日包 {len(nd)}")
-    if unrecognized:
-        log(
-            f"  ！{len(unrecognized)} 个包名认不出来（既非日包也非小时包），未处理：{unrecognized[:3]}"
-        )
-
-    now = int(time.time())
-    today = dt.date.today().isoformat()
-    want, unfinished, windowed = select_packs(
-        parsed, a.mode, a.hours, a.days, a.include_today, now, today
-    )
-    log(f"模式 {eff_mode}  ⇒ 本次考虑 {len(want)} 个（窗口外排除 {len(windowed)}）")
-    skipped = len(unfinished)
-    for nm in unfinished:
-        log(f"  跳过（还在长，未标 final）: {nm}")
-
-    todo, uptodate = [], 0
-    for x in want:
-        name = str(x["entry"].get("name") or "")
+        if day == today and not a.include_today:
+            log(f"  跳过（当天包还会增长）: {name}")
+            skipped += 1
+            continue
         dest = packs / name
-        wantsha = str(x["entry"].get("sha256") or "")
+        want = str(f.get("sha256") or "")
         if dest.exists() and not a.force:
-            if wantsha and sha256_of(dest) == wantsha:
+            got = sha256_of(dest)
+            if want and got == want:
                 uptodate += 1
                 if not a.no_extract and not a.list:
                     # 合并解压（不再假设「目录在 = 已解压」）：
-                    # ① 当前小时/当天的包会被同名重打 ⇒ 目录在也可能缺新文件；
-                    # ② 本地目录可能被人工动过（或被采集器中断写坏）⇒ 按包内容补齐。
+                    # ① 当天包会被同名重打 ⇒ 目录在也可能缺新文件；
+                    # ② 本地目录可能被人工动过 ⇒ 按包内容补齐。
                     # 幂等且只几秒，比静默漏数据便宜得多（2026-09-12 修）。
                     # `--list` 是「只列状态」⇒ 不写盘。
                     extract(dest, root)
                 continue
             log(f"  需重下（sha 不一致）: {name}")
-        todo.append(x)
+        todo.append((f, dest, want))
 
-    log(f"状态：已最新 {uptodate} 个 | 待补 {len(todo)} 个 | 跳过未完成 {skipped} 个")
+    log(f"状态：已最新 {uptodate} 个 | 待补 {len(todo)} 个 | 跳过当天 {skipped} 个")
     if a.list or not todo:
-        for x in todo:
-            nm = str(x["entry"].get("name"))
-            log(f"  - {nm}  {(x['entry'].get('size') or 0) / 1048576:.1f} MB")
-        if a.list:
-            miss = [str(x["entry"].get("name")) for x in todo]
-            if miss:
-                log(
-                    f"缺 {len(miss)} 个（{eff_mode} 粒度）："
-                    + ", ".join(miss[:8])
-                    + (" …" if len(miss) > 8 else "")
-                )
+        for f, dest, want in todo:
+            log(f"  - {f['name']}  {f['size'] / 1048576:.1f} MB")
         return 0
 
     ok = 0
-    warn = 0
-    for x in todo:
-        name = str(x["entry"]["name"])
-        log(f"→ {name}（{(x['entry'].get('size') or 0) / 1048576:.1f} MB）")
-        if not download(a.base, name, packs / name, jobs=a.jobs, chunk_mb=a.chunk_mb):
+    for f, dest, want in todo:
+        name = f["name"]
+        log(f"→ {name}（{(f.get('size') or 0) / 1048576:.1f} MB）")
+        if not download(a.base, name, dest, jobs=a.jobs, chunk_mb=a.chunk_mb):
             continue
-        dest = packs / name
         got = sha256_of(dest)
-        want_sha = str(x["entry"].get("sha256") or "")
-        if want_sha and got != want_sha:
+        if want and got != want:
             log(
-                f"    ！sha256 不符（期望 {want_sha[:12]}… 实得 {got[:12]}…）⇒ 删除重来更安全，已保留文件供排查"
+                f"    ！sha256 不符（期望 {want[:12]}… 实得 {got[:12]}…）⇒ 删除重来更安全，已保留文件供排查"
             )
             continue
         (packs / (name + ".sha256")).write_text(f"{got}  {name}\n", encoding="utf-8")
@@ -634,18 +335,7 @@ def main() -> int:
             t0 = time.time()
             if extract(dest, root):
                 log(f"    已解压到 {root}（{time.time() - t0:.1f}s）")
-                nf = x["entry"].get("nfiles")
-                if isinstance(nf, int) and nf > 0:
-                    lf = local_files_for(root, x)
-                    if lf != nf:
-                        warn += 1
-                        log(
-                            f"    ！本地该粒度文件数 {lf} ≠ 包内 {nf}"
-                            f"（缺 = 没解压全；多 = 本地有已删文件）"
-                        )
-    log(
-        f"完成：成功 {ok}/{len(todo)}" + (f"｜文件数对账告警 {warn} 个" if warn else "")
-    )
+    log(f"完成：成功 {ok}/{len(todo)}")
     return 0 if ok == len(todo) else 1
 
 
