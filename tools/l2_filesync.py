@@ -49,6 +49,7 @@ import concurrent.futures as cf
 import hashlib
 import os
 import re
+import shlex
 import subprocess
 import time
 
@@ -354,6 +355,21 @@ def selftest() -> int:
             "坏行/空行/注释都不会让读清单崩，且好行照收",
             gotb == {"2026-09-16/ok.jsonl.gz": 7},
         )
+
+        print("[6] 复比残留分类：仍在写入 vs 真不一致")
+        s2 = [("a.jsonl.gz", 100, 200), ("b.jsonl.gz", 100, 200)]
+        g, r = classify_remaining(
+            s2,
+            {"a.jsonl.gz": 300, "b.jsonl.gz": 200},
+            {"a.jsonl.gz": 200, "b.jsonl.gz": 200},
+        )
+        chk("远端大小又变了 -> 仍在写（采集器开着句柄，不算失败）", g == ["a.jsonl.gz"])
+        chk("远端大小没变 -> 真不一致（要重拉/排查）", r == ["b.jsonl.gz"])
+        g2, r2 = classify_remaining([("c.jsonl.gz", 1, 2)], {}, {"c.jsonl.gz": 2})
+        chk(
+            "远端文件已消失（取不到大小）也归入“不算失败”，交下次重比",
+            g2 == ["c.jsonl.gz"] and r2 == [],
+        )
     finally:
         import shutil
 
@@ -365,6 +381,50 @@ def selftest() -> int:
         return 1
     log("自检全部通过")
     return 0
+
+
+def remote_sizes(
+    key: str, host: str, remote_root: str, rels: list[str]
+) -> dict[str, int]:
+    """按需取几个远端文件的大小（一条 ssh；用于复比时判定"是不是还在写"）。"""
+    out: dict[str, int] = {}
+    for i in range(0, len(rels), 200):
+        batch = rels[i : i + 200]
+        if not batch:
+            continue
+        cmd = "cd %s && stat -c '%%s %%n' %s" % (
+            remote_root,
+            " ".join(shlex.quote(r) for r in batch),
+        )
+        p = subprocess.run(
+            ["ssh", "-i", key, *SSH_OPTS, host, cmd],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        for line in p.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit():
+                out[parts[1].strip().lstrip("./")] = int(parts[0])
+    return out
+
+
+def classify_remaining(
+    short2: list[tuple[str, int, int]],
+    rem_now: dict[str, int],
+    rem_before: dict[str, int],
+) -> tuple[list[str], list[str]]:
+    """复比后的残留差异分类（纯函数 ⇒ 可离线自检）。
+
+    关键事实：采集器**正在写当前 bar 的 gz**。落盘后文件还会继续长 ⇒
+    本地拷贝是「某个时刻的合法快照」而不是错。判据：
+      远端大小在两次清单之间**变了** ⇒ 正在写 ⇒ 不算失败（下次跑会接着补）；
+      远端大小没变           ⇒ 真不一致 ⇒ 失败（要重拉/排查）。
+    """
+    growing, real = [], []
+    for rel, _local, _remote in short2:
+        (growing if rem_now.get(rel) != rem_before.get(rel) else real).append(rel)
+    return growing, real
 
 
 def main() -> int:
@@ -487,8 +547,33 @@ def main() -> int:
     # 复比：**用盘上的真实现场**校正清单后再比，不靠"跑完了"当结论
     loc2, gone2, changed2 = reconcile(loc, a.root)
     m2, s2, e2 = diff(rem, loc2, a.days)
+    growing: list[str] = []
+    if m2 or s2:
+        # 分清"采集器还在写"与真不一致：只有后者才是失败
+        probe = sorted(set(m2) | {x[0] for x in s2})
+        rem_now = remote_sizes(a.key, a.host, a.remote_root, probe)
+        growing, real2 = classify_remaining(s2, rem_now, rem)
+        # m2（本地缺）若远端又长了，也是同一回事（还没拉到就被改了）；统一按上面的判据看
+        growing_m = [r for r in m2 if rem_now.get(r) != rem.get(r)]
+        real_m = [r for r in m2 if r not in growing_m]
+        s2 = [x for x in s2 if x[0] not in growing]
+        m2 = real_m
+        growing = sorted(set(growing) | set(growing_m))
+        log(
+            "  仍在写入（远端大小又变了，不算失败）: %d 个%s"
+            % (len(growing), (": " + ", ".join(growing[:3])) if growing else "")
+        )
+        if real2:
+            log(
+                "  真不一致（远端大小没变）: %d 个: %s"
+                % (len(real2), ", ".join(real2[:3]))
+            )
     log("复比：缺 %d / 不符 %d（应为 0 / 0）" % (len(m2), len(s2)))
-    write_manifest(local_txt, loc2, lhdr("复比：缺 %d / 不符 %d" % (len(m2), len(s2))))
+    write_manifest(
+        local_txt,
+        loc2,
+        lhdr("复比：缺 %d / 不符 %d / 仍在写 %d" % (len(m2), len(s2), len(growing))),
+    )
     log("  本地清单 -> %s" % local_txt)
     if m2 or s2:
         log(
